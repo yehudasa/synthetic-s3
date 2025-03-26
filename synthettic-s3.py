@@ -1,3 +1,4 @@
+import sys
 import boto3
 import hashlib
 import string
@@ -19,6 +20,12 @@ class WorkloadConfig:
         self.max_objs = 20
         self.obj_max_size = 10000
 
+def sizeof_fmt(num, suffix="B"):
+    for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Yi{suffix}"
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
@@ -55,32 +62,68 @@ def list_snapshots(env):
 
     return snaps, snaps_by_name
 
+def get_snap_id(env, snap_id, snap_name):
+    if snap_id is not None:
+        return snap_id
+
+    if not snap_name:
+        return None
+
+    snaps, snaps_by_name = list_snapshots(env)
+    snap_id = snaps_by_name.get(snap_name)
+    if snap_id is None:
+        raise Exception(Fore.RED + 'ERROR: snapshot not found: ' + snap_name)
+
+    return snap_id
+
+def list_objects(env):
+    if env.snap_range is None:
+        return env.s3.list_objects(Bucket=env.conf.bucket_name)['Contents']
+    else:
+        return env.s3.list_objects(Bucket=env.conf.bucket_name, SnapRange = env.snap_range)['Contents']
+
 def get_object_key(env, obj_id):
     return f"{env.conf.prefix}object_{obj_id}.txt"
 
 def load_metadata(env):
     print(f"loading {env.conf.bucket_name}/{env.conf.metadata_object_key}")
     try:
-        response = env.s3.get_object(Bucket=env.conf.bucket_name, Key=env.conf.metadata_object_key)
-        metadata_content = response['Body'].read()
+        metadata_content = get_object(env, env.conf.bucket_name, env.conf.metadata_object_key)
         return json.loads(metadata_content)
-    except:
-        pass
+    except Exception as e:
+        print(e)
 
     return { 'objects': {},
             'generated_at': None }
 
 def get_object(env, bucket_name, key):
-    response = env.s3.get_object(Bucket=bucket_name, Key=key)
+    if env.snap_id is None:
+        response = env.s3.get_object(Bucket=bucket_name, Key=key)
+    else:
+        response = env.s3.get_object(Bucket=bucket_name, Key=key, SnapId=int(env.snap_id))
     return response['Body'].read().decode('utf-8')
 
 def put_object(env, bucket_name, key, data):
     env.s3.put_object(Bucket=bucket_name, Key=key, Body=data)
 
 class Env:
-    def __init__(self, conf):
+    def __init__(self, conf, init_snapshot = True):
         self.conf = conf
         self.s3 = boto3.client("s3")
+
+        self.snap_name = conf.snap_name
+        if init_snapshot:
+            self.snap_id = get_snap_id(self, conf.snap_id, conf.snap_name)
+        else:
+            self.snap_id = conf.snap_id
+        
+        self.snap_range = None
+        if self.snap_id is not None:
+            self.snap_range = str(self.snap_id)
+
+        if conf.all_objs:
+            self.snap_range = '-' + self.snap_range
+
 
 class SyntheticS3Workload:
     def __init__(self, env):
@@ -135,13 +178,18 @@ class SyntheticS3Workload:
         success = True
         fail_count = 0
 
+        print(self.metadata)
+
         for obj_id, obj_info in dict(sorted(self.metadata['objects'].items(), key=lambda item: int(item[0]))).items():
             key = obj_info['object_key']
             size = obj_info['size']
             obj_hash = obj_info['sha256']
 
-            actual_obj_data = get_object(self.env, self.conf.bucket_name, key)
-            actual_hash = sha256(actual_obj_data.encode('utf8'))
+            try:
+                actual_obj_data = get_object(self.env, self.conf.bucket_name, key)
+                actual_hash = sha256(actual_obj_data.encode('utf8'))
+            except:
+                actual_hash = '<error>'
 
             if actual_hash == obj_hash:
                 result_str = Fore.GREEN + 'OK'
@@ -150,7 +198,7 @@ class SyntheticS3Workload:
                 fail_count += 1
                 success = False
 
-            print(f'{obj_id:>3} : expected: {obj_hash} actual: {actual_hash} ... ' + result_str)
+            print(f'{obj_id:>3} : expected: {obj_hash:<65} actual: {actual_hash:<65} ... ' + result_str)
 
         if success:
             print(Fore.GREEN + 'SUCCESS')
@@ -160,7 +208,7 @@ class SyntheticS3Workload:
 
     def copy_bucket(self, dest_bucket):
         self.env.s3.create_bucket(Bucket=dest_bucket)
-        for key in self.env.s3.list_objects(Bucket=self.conf.bucket_name)['Contents']:
+        for key in list_objects(self.env):
             k = key['Key']
             if not k.startswith(self.conf.prefix):
                 continue
@@ -177,14 +225,16 @@ def main():
     parser = argparse.ArgumentParser(description="Script that takes a command and an optional bucket.")
     
     # Positional argument
-    parser.add_argument('command', choices=['generate', 'create-snapshot', 'get-meta', 'validate', 'list-snapshots', 'copy-bucket'], type=str)
+    parser.add_argument('command', choices=['generate', 'create-snapshot', 'get-meta', 'validate', 'list-snapshots', 'copy-bucket', 'list-objects'], type=str)
     
     # Optional argument
     parser.add_argument('--bucket', '-b', type=str, required=True)
     parser.add_argument('--prefix', type=str)
     parser.add_argument('--snap-name', type=str)
+    parser.add_argument('--snap-id', type=str)
     parser.add_argument('--description', type=str)
     parser.add_argument('--dest-bucket', type=str)
+    parser.add_argument('--all-objs', action='store_true')
 
     args = parser.parse_args()
 
@@ -193,8 +243,12 @@ def main():
 
     conf.bucket_name = args.bucket
     conf.prefix = args.prefix or conf.prefix
+    conf.snap_id = args.snap_id
+    conf.snap_name = args.snap_name
+    conf.all_objs = args.all_objs
 
-    env = Env(conf)
+    init_snapshot = args.command != 'create-snapshot'
+    env = Env(conf, init_snapshot=init_snapshot)
     workload = SyntheticS3Workload(env)
 
     if args.command == 'generate':
@@ -208,6 +262,20 @@ def main():
     elif args.command == 'list-snapshots':
         snaps, snaps_by_name = list_snapshots(env)
         print(json.dumps(snaps_by_name, indent=4, default=str))
+
+    elif args.command == 'list-objects':
+        try:
+            objs = list_objects(env)
+        except Exception as e:
+            print(e)
+            sys.exit(1)
+
+        total_size = 0
+        for o in objs:
+            print(f"{o['Key']:<28} {o['Size']:>10} {str(o['LastModified'])}")
+            # print(o['Key'] + ' ' + str(o['size']) + ' ' str(o['Date']))
+            total_size += o['Size']
+        print(f'\nTotal: {len(objs)} objects / {sizeof_fmt(total_size)}')
 
     elif args.command == 'get-meta':
         meta = load_metadata(env)
